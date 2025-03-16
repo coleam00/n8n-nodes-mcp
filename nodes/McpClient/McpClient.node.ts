@@ -17,45 +17,177 @@ declare const process: {
 	env: Record<string, string | undefined>;
 };
 
-// Create a singleton manager to keep track of client instances
+// Singleton class to manage MCP client instances
 class McpClientManager {
-	private static instances: Map<string, { client: Client; transport: Transport; lastUsed: number }> = new Map();
-	private static cleanupInterval: NodeJS.Timeout | null = null;
-	private static readonly IDLE_TIMEOUT = 300000; // 5 minutes (in milliseconds)
+	private static instance: McpClientManager;
+	private clients: Map<string, Client> = new Map();
+	private connectionStatus: Map<string, boolean> = new Map();
 
-	static async getClient(
-		clientKey: string,
-		createTransport: () => Promise<Transport>,
-		logger: { debug: (msg: string) => void; error: (msg: string) => void },
+	private constructor() {}
+
+	public static getInstance(): McpClientManager {
+		if (!McpClientManager.instance) {
+			McpClientManager.instance = new McpClientManager();
+		}
+		return McpClientManager.instance;
+	}
+
+	public async getClient(
+		connectionType: string,
+		credentials: any,
+		logger: any,
+		node: any,
 	): Promise<{ client: Client; transport: Transport }> {
-		// Start the cleanup interval if not already running
-		if (!this.cleanupInterval) {
-			this.cleanupInterval = setInterval(() => this.cleanupIdleInstances(logger), 60000); // Check every minute
+		// Create a unique key for this client configuration
+		const clientKey = this.createClientKey(connectionType, credentials);
+
+		// Check if we already have a client for this configuration
+		if (this.clients.has(clientKey) && this.connectionStatus.get(clientKey) !== false) {
+			const client = this.clients.get(clientKey)!;
+			logger.debug(`Using existing MCP client connection for key: ${clientKey}`);
+			
+			// Get the transport from the client
+			const transport = (client as any)._transport;
+			
+			// Make sure we have a valid transport
+			if (!transport) {
+				logger.debug('Transport not found in existing client, creating new client');
+				// Remove the invalid client
+				this.clients.delete(clientKey);
+				this.connectionStatus.delete(clientKey);
+				// Create a new client
+				return this.createNewClient(connectionType, credentials, logger, node, clientKey);
+			}
+			
+			// Check if the connection is still alive
+			try {
+				// A simple ping operation to check if the connection is still alive
+				// This could be any lightweight operation that verifies the connection
+				await client.listTools();
+				logger.debug('Connection is alive');
+			} catch (error) {
+				logger.debug(`Connection is dead, recreating: ${(error as Error).message}`);
+				// Mark the connection as dead
+				this.connectionStatus.set(clientKey, false);
+				// Remove the client
+				this.clients.delete(clientKey);
+				// Create a new client
+				return this.createNewClient(connectionType, credentials, logger, node, clientKey);
+			}
+			
+			return { client, transport };
 		}
 
-		// Check if we already have a client instance for this key
-		const existingInstance = this.instances.get(clientKey);
-		if (existingInstance) {
-			logger.debug(`Reusing existing MCP client instance for key: ${clientKey}`);
-			// Update the last used timestamp
-			existingInstance.lastUsed = Date.now();
-			return { client: existingInstance.client, transport: existingInstance.transport };
+		return this.createNewClient(connectionType, credentials, logger, node, clientKey);
+	}
+
+	private async createNewClient(
+		connectionType: string,
+		credentials: any,
+		logger: any,
+		node: any,
+		clientKey: string,
+	): Promise<{ client: Client; transport: Transport }> {
+		// Create a new transport and client
+		let transport: Transport;
+
+		if (connectionType === 'sse') {
+			// Dynamically import the SSE client to avoid TypeScript errors
+			const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
+
+			const sseUrl = credentials.sseUrl as string;
+			const messagesPostEndpoint = (credentials.messagesPostEndpoint as string) || '';
+
+			// Parse headers
+			const headers: Record<string, string> = {};
+			if (credentials.headers) {
+				const headerLines = (credentials.headers as string).split('\n');
+				for (const line of headerLines) {
+					const [name, value] = line.split(':', 2);
+					if (name && value) {
+						headers[name.trim()] = value.trim();
+					}
+				}
+			}
+
+			// Create SSE transport with dynamic import to avoid TypeScript errors
+			transport = new SSEClientTransport(
+				// @ts-ignore
+				new URL(sseUrl),
+				{
+					// @ts-ignore
+					eventSourceInit: { headers },
+					// @ts-ignore
+					requestInit: {
+						headers,
+						...(messagesPostEndpoint
+							? {
+									// @ts-ignore
+									endpoint: new URL(messagesPostEndpoint),
+							  }
+							: {}),
+					},
+				},
+			);
+
+			logger.debug(`Created SSE transport for MCP client URL: ${sseUrl}`);
+			if (messagesPostEndpoint) {
+				logger.debug(`Using custom POST endpoint: ${messagesPostEndpoint}`);
+			}
+		} else {
+			// Use stdio transport (default)
+			// Build environment variables object for MCP servers
+			const env: Record<string, string> = {
+				// Preserve the PATH environment variable to ensure commands can be found
+				PATH: process.env.PATH || '',
+			};
+
+			logger.debug(`Original PATH: ${process.env.PATH}`);
+
+			// Parse comma-separated environment variables from credentials
+			if (credentials.environments) {
+				const envPairs = (credentials.environments as string).split(/[,\n\s]+/);
+				for (const pair of envPairs) {
+					const trimmedPair = pair.trim();
+					if (trimmedPair) {
+						const equalsIndex = trimmedPair.indexOf('=');
+						if (equalsIndex > 0) {
+							const name = trimmedPair.substring(0, equalsIndex).trim();
+							const value = trimmedPair.substring(equalsIndex + 1).trim();
+							if (name && value !== undefined) {
+								env[name] = value;
+							}
+						}
+					}
+				}
+			}
+
+			// Process environment variables from Node.js
+			// This allows Docker environment variables to override credentials
+			for (const key in process.env) {
+				// Only pass through MCP-related environment variables
+				if (key.startsWith('MCP_') && process.env[key]) {
+					// Strip off the MCP_ prefix when passing to the MCP server
+					const envName = key.substring(4); // Remove 'MCP_'
+					env[envName] = process.env[key] as string;
+				}
+			}
+
+			transport = new StdioClientTransport({
+				command: credentials.command as string,
+				args: (credentials.args as string)?.split(' ') || [],
+				env: env, // Always pass the env with PATH preserved
+			});
+
+			// Use n8n's logger instead of console.log
+			logger.debug(
+				`Transport created for MCP client command: ${credentials.command}, PATH: ${env.PATH}`,
+			);
 		}
-
-		// Create a new client instance
-		logger.debug(`Creating new MCP client instance for key: ${clientKey}`);
-		const transport = await createTransport();
-
-		// Add error handling to transport
-		transport.onerror = (error) => {
-			logger.error(`Transport error for client ${clientKey}: ${error}`);
-			// Remove the instance on error so a new one will be created next time
-			this.instances.delete(clientKey);
-		};
 
 		const client = new Client(
 			{
-				name: `McpClient-${clientKey}`,
+				name: `McpClient-client`,
 				version: '1.0.0',
 			},
 			{
@@ -69,62 +201,27 @@ class McpClientManager {
 
 		try {
 			await client.connect(transport);
-			logger.debug(`Client ${clientKey} connected to MCP server`);
-
-			// Store the new instance
-			this.instances.set(clientKey, {
-				client,
-				transport,
-				lastUsed: Date.now(),
-			});
-
+			logger.debug('Client connected to MCP server');
+			
+			// Store the client in our map
+			this.clients.set(clientKey, client);
+			this.connectionStatus.set(clientKey, true);
+			
 			return { client, transport };
 		} catch (connectionError) {
 			logger.error(`MCP client connection error: ${(connectionError as Error).message}`);
-			throw connectionError;
+			throw new NodeOperationError(
+				node,
+				`Failed to connect to MCP server: ${(connectionError as Error).message}`,
+			);
 		}
 	}
 
-	static cleanupIdleInstances(logger: { debug: (msg: string) => void; error: (msg: string) => void }) {
-		const now = Date.now();
-		for (const [key, instance] of this.instances.entries()) {
-			if (now - instance.lastUsed > this.IDLE_TIMEOUT) {
-				logger.debug(`Cleaning up idle MCP client instance: ${key}`);
-				try {
-					// Attempt to disconnect client and close transport
-					instance.client.disconnect().catch((e) => logger.error(`Error disconnecting client: ${e}`));
-					instance.transport.close().catch((e) => logger.error(`Error closing transport: ${e}`));
-				} catch (error) {
-					logger.error(`Error during cleanup of instance ${key}: ${error}`);
-				} finally {
-					// Remove the instance from our map
-					this.instances.delete(key);
-				}
-			}
-		}
-
-		// If no instances left, clear the interval
-		if (this.instances.size === 0 && this.cleanupInterval) {
-			clearInterval(this.cleanupInterval);
-			this.cleanupInterval = null;
-		}
-	}
-
-	static async closeClient(
-		clientKey: string,
-		logger: { debug: (msg: string) => void; error: (msg: string) => void },
-	) {
-		const instance = this.instances.get(clientKey);
-		if (instance) {
-			logger.debug(`Explicitly closing MCP client instance: ${clientKey}`);
-			try {
-				await instance.client.disconnect();
-				await instance.transport.close();
-			} catch (error) {
-				logger.error(`Error closing client ${clientKey}: ${error}`);
-			} finally {
-				this.instances.delete(clientKey);
-			}
+	private createClientKey(connectionType: string, credentials: any): string {
+		if (connectionType === 'sse') {
+			return `sse:${credentials.sseUrl}:${credentials.messagesPostEndpoint || ''}`;
+		} else {
+			return `cmd:${credentials.command}:${credentials.args || ''}:${credentials.environments || ''}`;
 		}
 	}
 }
@@ -298,351 +395,295 @@ export class McpClient implements INodeType {
 			this.logger.debug('ConnectionType parameter not found, using default "cmd" transport');
 		}
 
-		// Generate a unique client key based on the credentials and connection type
-		let clientKey = '';
-
 		try {
-			// Create a function to generate the transport based on connection type
-			const createTransport = async (): Promise<Transport> => {
-				if (connectionType === 'sse') {
-					// Use SSE transport
-					const sseCredentials = await this.getCredentials('mcpClientSseApi');
-					clientKey = `sse-${sseCredentials.sseUrl as string}`;
+			let credentials;
+			
+			if (connectionType === 'sse') {
+				credentials = await this.getCredentials('mcpClientSseApi');
+			} else {
+				credentials = await this.getCredentials('mcpClientApi');
+			}
 
-					// Dynamically import the SSE client to avoid TypeScript errors
-					const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
+			// Get or create a client using the singleton manager
+			const clientManager = McpClientManager.getInstance();
+			const { client } = await clientManager.getClient(
+				connectionType, 
+				credentials, 
+				this.logger,
+				this.getNode(),
+			);
 
-					const sseUrl = sseCredentials.sseUrl as string;
-					const messagesPostEndpoint = (sseCredentials.messagesPostEndpoint as string) || '';
-
-					// Parse headers
-					const headers: Record<string, string> = {};
-					if (sseCredentials.headers) {
-						const headerLines = (sseCredentials.headers as string).split('\n');
-						for (const line of headerLines) {
-							const [name, value] = line.split(':', 2);
-							if (name && value) {
-								headers[name.trim()] = value.trim();
-							}
-						}
-					}
-
-					// Create SSE transport with dynamic import to avoid TypeScript errors
-					return new SSEClientTransport(
-						// @ts-ignore
-						new URL(sseUrl),
-						{
-							// @ts-ignore
-							eventSourceInit: { headers },
-							// @ts-ignore
-							requestInit: {
-								headers,
-								...(messagesPostEndpoint
-									? {
-											// @ts-ignore
-											endpoint: new URL(messagesPostEndpoint),
-									  }
-									: {}),
-							},
-						},
-					);
-				} else {
-					// Use stdio transport (default)
-					const cmdCredentials = await this.getCredentials('mcpClientApi');
-					const command = cmdCredentials.command as string;
-					const args = (cmdCredentials.args as string)?.split(' ') || [];
-					
-					// Include command and args in the client key for uniqueness
-					clientKey = `cmd-${command}-${args.join('-')}`;
-
-					// Build environment variables object for MCP servers
-					const env: Record<string, string> = {
-						// Preserve the PATH environment variable to ensure commands can be found
-						PATH: process.env.PATH || '',
-					};
-
-					this.logger.debug(`Original PATH: ${process.env.PATH}`);
-
-					// Parse comma-separated environment variables from credentials
-					if (cmdCredentials.environments) {
-						const envPairs = (cmdCredentials.environments as string).split(/[,\n\s]+/);
-						for (const pair of envPairs) {
-							const trimmedPair = pair.trim();
-							if (trimmedPair) {
-								const equalsIndex = trimmedPair.indexOf('=');
-								if (equalsIndex > 0) {
-									const name = trimmedPair.substring(0, equalsIndex).trim();
-									const value = trimmedPair.substring(equalsIndex + 1).trim();
-									if (name && value !== undefined) {
-										env[name] = value;
-										
-										// Add environment variables to client key for uniqueness
-										if (name.startsWith('BRAVE_') || name.startsWith('MCP_')) {
-											clientKey += `-${name}=${value}`;
-										}
-									}
-								}
-							}
-						}
-					}
-
-					// Process environment variables from Node.js
-					// This allows Docker environment variables to override credentials
-					for (const key in process.env) {
-						// Only pass through MCP-related environment variables
-						if (key.startsWith('MCP_') && process.env[key]) {
-							// Strip off the MCP_ prefix when passing to the MCP server
-							const envName = key.substring(4); // Remove 'MCP_'
-							env[envName] = process.env[key] as string;
-							
-							// Add to client key
-							clientKey += `-${envName}=${env[envName]}`;
-						}
-					}
-
-					return new StdioClientTransport({
-						command,
-						args,
-						env, // Always pass the env with PATH preserved
-					});
-				}
-			};
-
-			// Use the singleton manager to get or create a client
-			const { client } = await McpClientManager.getClient(clientKey, createTransport, this.logger);
-
-			// Execute the operation
 			switch (operation) {
 				case 'listResources': {
-					const resources = await client.listResources();
-					returnData.push({
-						json: { resources },
-					});
+					try {
+						const resources = await client.listResources();
+						returnData.push({
+							json: { resources },
+						});
+					} catch (error) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Failed to list resources: ${(error as Error).message}`,
+						);
+					}
 					break;
 				}
 
 				case 'readResource': {
-					const uri = this.getNodeParameter('resourceUri', 0) as string;
-					const resource = await client.readResource({
-						uri,
-					});
-					returnData.push({
-						json: { resource },
-					});
+					try {
+						const uri = this.getNodeParameter('resourceUri', 0) as string;
+						const resource = await client.readResource({
+							uri,
+						});
+						returnData.push({
+							json: { resource },
+						});
+					} catch (error) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Failed to read resource: ${(error as Error).message}`,
+						);
+					}
 					break;
 				}
 
 				case 'listTools': {
-					const rawTools = await client.listTools();
-					const tools = Array.isArray(rawTools)
-						? rawTools
-						: Array.isArray(rawTools?.tools)
-						? rawTools.tools
-						: Object.values(rawTools?.tools || {});
+					try {
+						const rawTools = await client.listTools();
+						const tools = Array.isArray(rawTools)
+							? rawTools
+							: Array.isArray(rawTools?.tools)
+							? rawTools.tools
+							: Object.values(rawTools?.tools || {});
 
-					if (!tools.length) {
-						throw new NodeOperationError(this.getNode(), 'No tools found from MCP client');
-					}
+						if (!tools.length) {
+							throw new NodeOperationError(this.getNode(), 'No tools found from MCP client');
+						}
 
-					const aiTools = tools.map((tool: any) => {
-						const paramSchema = tool.inputSchema?.properties
-							? z.object(
-									Object.entries(tool.inputSchema.properties).reduce(
-										(acc: any, [key, prop]: [string, any]) => {
-											let zodType: z.ZodType;
+						const aiTools = tools.map((tool: any) => {
+							const paramSchema = tool.inputSchema?.properties
+								? z.object(
+										Object.entries(tool.inputSchema.properties).reduce(
+											(acc: any, [key, prop]: [string, any]) => {
+												let zodType: z.ZodType;
 
-											switch (prop.type) {
-												case 'string':
-													zodType = z.string();
-													break;
-												case 'number':
-													zodType = z.number();
-													break;
-												case 'integer':
-													zodType = z.number().int();
-													break;
-												case 'boolean':
-													zodType = z.boolean();
-													break;
-												case 'array':
-													if (prop.items?.type === 'string') {
-														zodType = z.array(z.string());
-													} else if (prop.items?.type === 'number') {
-														zodType = z.array(z.number());
-													} else if (prop.items?.type === 'boolean') {
-														zodType = z.array(z.boolean());
-													} else {
-														zodType = z.array(z.any());
-													}
-													break;
-												case 'object':
-													zodType = z.record(z.string(), z.any());
-													break;
-												default:
-													zodType = z.any();
-											}
+												switch (prop.type) {
+													case 'string':
+														zodType = z.string();
+														break;
+													case 'number':
+														zodType = z.number();
+														break;
+													case 'integer':
+														zodType = z.number().int();
+														break;
+													case 'boolean':
+														zodType = z.boolean();
+														break;
+													case 'array':
+														if (prop.items?.type === 'string') {
+															zodType = z.array(z.string());
+														} else if (prop.items?.type === 'number') {
+															zodType = z.array(z.number());
+														} else if (prop.items?.type === 'boolean') {
+															zodType = z.array(z.boolean());
+														} else {
+															zodType = z.array(z.any());
+														}
+														break;
+													case 'object':
+														zodType = z.record(z.string(), z.any());
+														break;
+													default:
+														zodType = z.any();
+												}
 
-											if (prop.description) {
-												zodType = zodType.describe(prop.description);
-											}
+												if (prop.description) {
+													zodType = zodType.describe(prop.description);
+												}
 
-											if (!tool.inputSchema?.required?.includes(key)) {
-												zodType = zodType.optional();
-											}
+												if (!tool.inputSchema?.required?.includes(key)) {
+													zodType = zodType.optional();
+												}
 
-											return {
-												...acc,
-												[key]: zodType,
-											};
-										},
-										{},
-									),
+												return {
+													...acc,
+													[key]: zodType,
+												};
+											},
+											{},
+										),
 							  )
 							: z.object({});
 
-						return new DynamicStructuredTool({
-							name: tool.name,
-							description: tool.description || `Execute the ${tool.name} tool`,
-							schema: paramSchema,
-							func: async (params) => {
-								try {
-									const result = await client.callTool({
-										name: tool.name,
-										arguments: params,
-									});
+							return new DynamicStructuredTool({
+								name: tool.name,
+								description: tool.description || `Execute the ${tool.name} tool`,
+								schema: paramSchema,
+								func: async (params) => {
+									try {
+										const result = await client.callTool({
+											name: tool.name,
+											arguments: params,
+										});
 
-									return typeof result === 'object' ? JSON.stringify(result) : String(result);
-								} catch (error) {
-									throw new NodeOperationError(
-										this.getNode(),
-										`Failed to execute ${tool.name}: ${(error as Error).message}`,
-									);
-								}
+										return typeof result === 'object' ? JSON.stringify(result) : String(result);
+									} catch (error) {
+										throw new NodeOperationError(
+											this.getNode(),
+											`Failed to execute ${tool.name}: ${(error as Error).message}`,
+										);
+									}
+								},
+							});
+						});
+
+						returnData.push({
+							json: {
+								tools: aiTools.map((t: DynamicStructuredTool) => ({
+									name: t.name,
+									description: t.description,
+									schema: Object.keys(t.schema.shape || {}),
+								})),
 							},
 						});
-					});
-
-					returnData.push({
-						json: {
-							tools: aiTools.map((t: DynamicStructuredTool) => ({
-								name: t.name,
-								description: t.description,
-								schema: Object.keys(t.schema.shape || {}),
-							})),
-						},
-					});
+					} catch (error) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Failed to list tools: ${(error as Error).message}`,
+						);
+					}
 					break;
 				}
 
 				case 'executeTool': {
-					const toolName = this.getNodeParameter('toolName', 0) as string;
-					let toolParams;
-
 					try {
-						const rawParams = this.getNodeParameter('toolParameters', 0);
-						this.logger.debug(`Raw tool parameters: ${JSON.stringify(rawParams)}`);
+						const toolName = this.getNodeParameter('toolName', 0) as string;
+						let toolParams;
 
-						// Handle different parameter types
-						if (rawParams === undefined || rawParams === null) {
-							// Handle null/undefined case
-							toolParams = {};
-						} else if (typeof rawParams === 'string') {
-							// Handle string input (typical direct node usage)
-							if (!rawParams || rawParams.trim() === '') {
+						try {
+							const rawParams = this.getNodeParameter('toolParameters', 0);
+							this.logger.debug(`Raw tool parameters: ${JSON.stringify(rawParams)}`);
+
+							// Handle different parameter types
+							if (rawParams === undefined || rawParams === null) {
+								// Handle null/undefined case
 								toolParams = {};
+							} else if (typeof rawParams === 'string') {
+								// Handle string input (typical direct node usage)
+								if (!rawParams || rawParams.trim() === '') {
+									toolParams = {};
+								} else {
+									toolParams = JSON.parse(rawParams);
+								}
+							} else if (typeof rawParams === 'object') {
+								// Handle object input (when used as a tool in AI Agent)
+								toolParams = rawParams;
 							} else {
-								toolParams = JSON.parse(rawParams);
+								// Try to convert other types to object
+								try {
+									toolParams = JSON.parse(JSON.stringify(rawParams));
+								} catch (parseError) {
+									throw new NodeOperationError(
+										this.getNode(),
+										`Invalid parameter type: ${typeof rawParams}`,
+									);
+								}
 							}
-						} else if (typeof rawParams === 'object') {
-							// Handle object input (when used as a tool in AI Agent)
-							toolParams = rawParams;
-						} else {
-							// Try to convert other types to object
-							try {
-								toolParams = JSON.parse(JSON.stringify(rawParams));
-							} catch (parseError) {
-								throw new NodeOperationError(
-									this.getNode(),
-									`Invalid parameter type: ${typeof rawParams}`,
-								);
+
+							// Ensure toolParams is an object
+							if (
+								typeof toolParams !== 'object' ||
+								toolParams === null ||
+								Array.isArray(toolParams)
+							) {
+								throw new NodeOperationError(this.getNode(), 'Tool parameters must be a JSON object');
 							}
-						}
-
-						// Ensure toolParams is an object
-						if (
-							typeof toolParams !== 'object' ||
-							toolParams === null ||
-							Array.isArray(toolParams)
-						) {
-							throw new NodeOperationError(this.getNode(), 'Tool parameters must be a JSON object');
-						}
-					} catch (error) {
-						throw new NodeOperationError(
-							this.getNode(),
-							`Failed to parse tool parameters: ${
-								(error as Error).message
-							}. Make sure the parameters are valid JSON.`,
-						);
-					}
-
-					// Validate tool exists before executing
-					try {
-						const availableTools = await client.listTools();
-						const toolsList = Array.isArray(availableTools)
-							? availableTools
-							: Array.isArray(availableTools?.tools)
-							? availableTools.tools
-							: Object.values(availableTools?.tools || {});
-
-						const toolExists = toolsList.some((tool: any) => tool.name === toolName);
-
-						if (!toolExists) {
-							const availableToolNames = toolsList.map((t: any) => t.name).join(', ');
+						} catch (error) {
 							throw new NodeOperationError(
 								this.getNode(),
-								`Tool '${toolName}' does not exist. Available tools: ${availableToolNames}`,
+								`Failed to parse tool parameters: ${(error as Error).message}. Make sure the parameters are valid JSON.`,
 							);
 						}
 
-						this.logger.debug(
-							`Executing tool: ${toolName} with params: ${JSON.stringify(toolParams)}`,
-						);
+						// Validate tool exists before executing
+						try {
+							const availableTools = await client.listTools();
+							const toolsList = Array.isArray(availableTools)
+								? availableTools
+								: Array.isArray(availableTools?.tools)
+								? availableTools.tools
+								: Object.values(availableTools?.tools || {});
 
-						const result = await client.callTool({
-							name: toolName,
-							arguments: toolParams,
-						});
+							const toolExists = toolsList.some((tool: any) => tool.name === toolName);
 
-						this.logger.debug(`Tool executed successfully: ${JSON.stringify(result)}`);
+							if (!toolExists) {
+								const availableToolNames = toolsList.map((t: any) => t.name).join(', ');
+								throw new NodeOperationError(
+									this.getNode(),
+									`Tool '${toolName}' does not exist. Available tools: ${availableToolNames}`,
+								);
+							}
 
-						returnData.push({
-							json: { result },
-						});
+							this.logger.debug(
+								`Executing tool: ${toolName} with params: ${JSON.stringify(toolParams)}`,
+							);
+
+							const result = await client.callTool({
+								name: toolName,
+								arguments: toolParams,
+							});
+
+							this.logger.debug(`Tool executed successfully: ${JSON.stringify(result)}`);
+
+							returnData.push({
+								json: { result },
+							});
+						} catch (error) {
+							throw new NodeOperationError(
+								this.getNode(),
+								`Failed to execute tool '${toolName}': ${(error as Error).message}`,
+							);
+						}
 					} catch (error) {
 						throw new NodeOperationError(
 							this.getNode(),
-							`Failed to execute tool '${toolName}': ${(error as Error).message}`,
+							`Failed to execute tool: ${(error as Error).message}`,
 						);
 					}
 					break;
 				}
 
 				case 'listPrompts': {
-					const prompts = await client.listPrompts();
-					returnData.push({
-						json: { prompts },
-					});
+					try {
+						const prompts = await client.listPrompts();
+						returnData.push({
+							json: { prompts },
+						});
+					} catch (error) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Failed to list prompts: ${(error as Error).message}`,
+						);
+					}
 					break;
 				}
 
 				case 'getPrompt': {
-					const promptName = this.getNodeParameter('promptName', 0) as string;
-					const prompt = await client.getPrompt({
-						name: promptName,
-					});
-					returnData.push({
-						json: { prompt },
-					});
+					try {
+						const promptName = this.getNodeParameter('promptName', 0) as string;
+						const prompt = await client.getPrompt({
+							name: promptName,
+						});
+						returnData.push({
+							json: { prompt },
+						});
+					} catch (error) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Failed to get prompt: ${(error as Error).message}`,
+						);
+					}
 					break;
 				}
 
@@ -652,15 +693,6 @@ export class McpClient implements INodeType {
 
 			return [returnData];
 		} catch (error) {
-			// If there's an error, we might want to clean up this client instance
-			if (clientKey) {
-				try {
-					await McpClientManager.closeClient(clientKey, this.logger);
-				} catch (cleanupError) {
-					this.logger.error(`Error cleaning up client after error: ${cleanupError}`);
-				}
-			}
-			
 			throw new NodeOperationError(
 				this.getNode(),
 				`Failed to execute operation: ${(error as Error).message}`,

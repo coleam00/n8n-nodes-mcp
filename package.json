@@ -1,6 +1,6 @@
 {
-	"name": "n8n-nodes-mcp",
-	"version": "0.1.10",
+	"name": "@coleam/n8n-nodes-mcp",
+	"version": "0.1.13",
 	"description": "MCP nodes for n8n ",
 	"keywords": [
 		"n8n-community-node-package"
