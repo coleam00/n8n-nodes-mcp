@@ -17,6 +17,118 @@ declare const process: {
 	env: Record<string, string | undefined>;
 };
 
+// Create a singleton manager to keep track of client instances
+class McpClientManager {
+	private static instances: Map<string, { client: Client; transport: Transport; lastUsed: number }> = new Map();
+	private static cleanupInterval: NodeJS.Timeout | null = null;
+	private static readonly IDLE_TIMEOUT = 300000; // 5 minutes (in milliseconds)
+
+	static async getClient(
+		clientKey: string,
+		createTransport: () => Promise<Transport>,
+		logger: { debug: (msg: string) => void; error: (msg: string) => void },
+	): Promise<{ client: Client; transport: Transport }> {
+		// Start the cleanup interval if not already running
+		if (!this.cleanupInterval) {
+			this.cleanupInterval = setInterval(() => this.cleanupIdleInstances(logger), 60000); // Check every minute
+		}
+
+		// Check if we already have a client instance for this key
+		const existingInstance = this.instances.get(clientKey);
+		if (existingInstance) {
+			logger.debug(`Reusing existing MCP client instance for key: ${clientKey}`);
+			// Update the last used timestamp
+			existingInstance.lastUsed = Date.now();
+			return { client: existingInstance.client, transport: existingInstance.transport };
+		}
+
+		// Create a new client instance
+		logger.debug(`Creating new MCP client instance for key: ${clientKey}`);
+		const transport = await createTransport();
+
+		// Add error handling to transport
+		transport.onerror = (error) => {
+			logger.error(`Transport error for client ${clientKey}: ${error}`);
+			// Remove the instance on error so a new one will be created next time
+			this.instances.delete(clientKey);
+		};
+
+		const client = new Client(
+			{
+				name: `McpClient-${clientKey}`,
+				version: '1.0.0',
+			},
+			{
+				capabilities: {
+					prompts: {},
+					resources: {},
+					tools: {},
+				},
+			},
+		);
+
+		try {
+			await client.connect(transport);
+			logger.debug(`Client ${clientKey} connected to MCP server`);
+
+			// Store the new instance
+			this.instances.set(clientKey, {
+				client,
+				transport,
+				lastUsed: Date.now(),
+			});
+
+			return { client, transport };
+		} catch (connectionError) {
+			logger.error(`MCP client connection error: ${(connectionError as Error).message}`);
+			throw connectionError;
+		}
+	}
+
+	static cleanupIdleInstances(logger: { debug: (msg: string) => void; error: (msg: string) => void }) {
+		const now = Date.now();
+		for (const [key, instance] of this.instances.entries()) {
+			if (now - instance.lastUsed > this.IDLE_TIMEOUT) {
+				logger.debug(`Cleaning up idle MCP client instance: ${key}`);
+				try {
+					// Attempt to disconnect client and close transport
+					instance.client.disconnect().catch((e) => logger.error(`Error disconnecting client: ${e}`));
+					instance.transport.close().catch((e) => logger.error(`Error closing transport: ${e}`));
+				} catch (error) {
+					logger.error(`Error during cleanup of instance ${key}: ${error}`);
+				} finally {
+					// Remove the instance from our map
+					this.instances.delete(key);
+				}
+			}
+		}
+
+		// If no instances left, clear the interval
+		if (this.instances.size === 0 && this.cleanupInterval) {
+			clearInterval(this.cleanupInterval);
+			this.cleanupInterval = null;
+		}
+	}
+
+	static async closeClient(
+		clientKey: string,
+		logger: { debug: (msg: string) => void; error: (msg: string) => void },
+	) {
+		const instance = this.instances.get(clientKey);
+		if (instance) {
+			logger.debug(`Explicitly closing MCP client instance: ${clientKey}`);
+			try {
+				await instance.client.disconnect();
+				await instance.transport.close();
+			} catch (error) {
+				logger.error(`Error closing client ${clientKey}: ${error}`);
+			} finally {
+				this.instances.delete(clientKey);
+			}
+		}
+	}
+}
+
 export class McpClient implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'MCP Client',
@@ -186,138 +298,120 @@ export class McpClient implements INodeType {
 			this.logger.debug('ConnectionType parameter not found, using default "cmd" transport');
 		}
 
+		// Generate a unique client key based on the credentials and connection type
+		let clientKey = '';
+
 		try {
-			let transport: Transport;
+			// Create a function to generate the transport based on connection type
+			const createTransport = async (): Promise<Transport> => {
+				if (connectionType === 'sse') {
+					// Use SSE transport
+					const sseCredentials = await this.getCredentials('mcpClientSseApi');
+					clientKey = `sse-${sseCredentials.sseUrl as string}`;
 
-			if (connectionType === 'sse') {
-				// Use SSE transport
-				const sseCredentials = await this.getCredentials('mcpClientSseApi');
+					// Dynamically import the SSE client to avoid TypeScript errors
+					const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
 
-				// Dynamically import the SSE client to avoid TypeScript errors
-				const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
+					const sseUrl = sseCredentials.sseUrl as string;
+					const messagesPostEndpoint = (sseCredentials.messagesPostEndpoint as string) || '';
 
-				const sseUrl = sseCredentials.sseUrl as string;
-				const messagesPostEndpoint = (sseCredentials.messagesPostEndpoint as string) || '';
-
-				// Parse headers
-				const headers: Record<string, string> = {};
-				if (sseCredentials.headers) {
-					const headerLines = (sseCredentials.headers as string).split('\n');
-					for (const line of headerLines) {
-						const [name, value] = line.split(':', 2);
-						if (name && value) {
-							headers[name.trim()] = value.trim();
+					// Parse headers
+					const headers: Record<string, string> = {};
+					if (sseCredentials.headers) {
+						const headerLines = (sseCredentials.headers as string).split('\n');
+						for (const line of headerLines) {
+							const [name, value] = line.split(':', 2);
+							if (name && value) {
+								headers[name.trim()] = value.trim();
+							}
 						}
 					}
-				}
 
-				// Create SSE transport with dynamic import to avoid TypeScript errors
-				transport = new SSEClientTransport(
-					// @ts-ignore
-					new URL(sseUrl),
-					{
+					// Create SSE transport with dynamic import to avoid TypeScript errors
+					return new SSEClientTransport(
 						// @ts-ignore
-						eventSourceInit: { headers },
-						// @ts-ignore
-						requestInit: {
-							headers,
-							...(messagesPostEndpoint
-								? {
-										// @ts-ignore
-										endpoint: new URL(messagesPostEndpoint),
-								  }
-								: {}),
+						new URL(sseUrl),
+						{
+							// @ts-ignore
+							eventSourceInit: { headers },
+							// @ts-ignore
+							requestInit: {
+								headers,
+								...(messagesPostEndpoint
+									? {
+											// @ts-ignore
+											endpoint: new URL(messagesPostEndpoint),
+									  }
+									: {}),
+							},
 						},
-					},
-				);
+					);
+				} else {
+					// Use stdio transport (default)
+					const cmdCredentials = await this.getCredentials('mcpClientApi');
+					const command = cmdCredentials.command as string;
+					const args = (cmdCredentials.args as string)?.split(' ') || [];
+					
+					// Include command and args in the client key for uniqueness
+					clientKey = `cmd-${command}-${args.join('-')}`;
 
-				this.logger.debug(`Created SSE transport for MCP client URL: ${sseUrl}`);
-				if (messagesPostEndpoint) {
-					this.logger.debug(`Using custom POST endpoint: ${messagesPostEndpoint}`);
-				}
-			} else {
-				// Use stdio transport (default)
-				const cmdCredentials = await this.getCredentials('mcpClientApi');
+					// Build environment variables object for MCP servers
+					const env: Record<string, string> = {
+						// Preserve the PATH environment variable to ensure commands can be found
+						PATH: process.env.PATH || '',
+					};
 
-				// Build environment variables object for MCP servers
-				const env: Record<string, string> = {
-					// Preserve the PATH environment variable to ensure commands can be found
-					PATH: process.env.PATH || '',
-				};
+					this.logger.debug(`Original PATH: ${process.env.PATH}`);
 
-				this.logger.debug(`Original PATH: ${process.env.PATH}`);
-
-				// Parse comma-separated environment variables from credentials
-				if (cmdCredentials.environments) {
-					const envPairs = (cmdCredentials.environments as string).split(/[,\n\s]+/);
-					for (const pair of envPairs) {
-						const trimmedPair = pair.trim();
-						if (trimmedPair) {
-							const equalsIndex = trimmedPair.indexOf('=');
-							if (equalsIndex > 0) {
-								const name = trimmedPair.substring(0, equalsIndex).trim();
-								const value = trimmedPair.substring(equalsIndex + 1).trim();
-								if (name && value !== undefined) {
-									env[name] = value;
+					// Parse comma-separated environment variables from credentials
+					if (cmdCredentials.environments) {
+						const envPairs = (cmdCredentials.environments as string).split(/[,\n\s]+/);
+						for (const pair of envPairs) {
+							const trimmedPair = pair.trim();
+							if (trimmedPair) {
+								const equalsIndex = trimmedPair.indexOf('=');
+								if (equalsIndex > 0) {
+									const name = trimmedPair.substring(0, equalsIndex).trim();
+									const value = trimmedPair.substring(equalsIndex + 1).trim();
+									if (name && value !== undefined) {
+										env[name] = value;
+										
+										// Add environment variables to client key for uniqueness
+										if (name.startsWith('BRAVE_') || name.startsWith('MCP_')) {
+											clientKey += `-${name}=${value}`;
+										}
+									}
 								}
 							}
 						}
 					}
-				}
 
-				// Process environment variables from Node.js
-				// This allows Docker environment variables to override credentials
-				for (const key in process.env) {
-					// Only pass through MCP-related environment variables
-					if (key.startsWith('MCP_') && process.env[key]) {
-						// Strip off the MCP_ prefix when passing to the MCP server
-						const envName = key.substring(4); // Remove 'MCP_'
-						env[envName] = process.env[key] as string;
+					// Process environment variables from Node.js
+					// This allows Docker environment variables to override credentials
+					for (const key in process.env) {
+						// Only pass through MCP-related environment variables
+						if (key.startsWith('MCP_') && process.env[key]) {
+							// Strip off the MCP_ prefix when passing to the MCP server
+							const envName = key.substring(4); // Remove 'MCP_'
+							env[envName] = process.env[key] as string;
+							
+							// Add to client key
+							clientKey += `-${envName}=${env[envName]}`;
+						}
 					}
+
+					return new StdioClientTransport({
+						command,
+						args,
+						env, // Always pass the env with PATH preserved
+					});
 				}
-
-				transport = new StdioClientTransport({
-					command: cmdCredentials.command as string,
-					args: (cmdCredentials.args as string)?.split(' ') || [],
-					env: env, // Always pass the env with PATH preserved
-				});
-
-				// Use n8n's logger instead of console.log
-				this.logger.debug(
-					`Transport created for MCP client command: ${cmdCredentials.command}, PATH: ${env.PATH}`,
-				);
-			}
-
-			// Add error handling to transport
-			transport.onerror = (error) => {
-				throw new NodeOperationError(this.getNode(), `Transport error: ${error}`);
 			};
 
-			const client = new Client(
-				{
-					name: `${McpClient.name}-client`,
-					version: '1.0.0',
-				},
-				{
-					capabilities: {
-						prompts: {},
-						resources: {},
-						tools: {},
-					},
-				},
-			);
+			// Use the singleton manager to get or create a client
+			const { client } = await McpClientManager.getClient(clientKey, createTransport, this.logger);
 
-			try {
-				await client.connect(transport);
-				this.logger.debug('Client connected to MCP server');
-			} catch (connectionError) {
-				this.logger.error(`MCP client connection error: ${(connectionError as Error).message}`);
-				throw new NodeOperationError(
-					this.getNode(),
-					`Failed to connect to MCP server: ${(connectionError as Error).message}`,
-				);
-			}
-
+			// Execute the operation
 			switch (operation) {
 				case 'listResources': {
 					const resources = await client.listResources();
@@ -558,6 +652,15 @@ export class McpClient implements INodeType {
 
 			return [returnData];
 		} catch (error) {
+			// If there's an error, we might want to clean up this client instance
+			if (clientKey) {
+				try {
+					await McpClientManager.closeClient(clientKey, this.logger);
+				} catch (cleanupError) {
+					this.logger.error(`Error cleaning up client after error: ${cleanupError}`);
+				}
+			}
+			
 			throw new NodeOperationError(
 				this.getNode(),
 				`Failed to execute operation: ${(error as Error).message}`,
